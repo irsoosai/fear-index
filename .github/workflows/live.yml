@@ -25,6 +25,8 @@ jobs:
           python-version: "3.12"
 
       - name: Build data/live.json from intraday quotes
+        env:
+          FMP_API_KEY: ${{ secrets.FMP_API_KEY }}
         run: python scripts/live.py --fear data/fear.json --out data/live.json
 
       - name: Commit if changed
