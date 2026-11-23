@@ -115,7 +115,7 @@
         <li>The composite is the equal-weight average of the available component scores (at least 5 of 7 required).</li>
         <li>Bands: 0-24 Extreme Fear, 25-44 Fear, 45-55 Neutral, 56-75 Greed, 76-100 Extreme Greed.</li>
         <li>Safe haven demand uses a 10y Treasury return proxy: -8.5 x yield change + carry. Price strength uses distance from the 52-week high in place of new highs/lows breadth, which has no free history.</li>
-        <li>Live estimate: during market hours a second job pulls delayed Yahoo Finance quotes (^GSPC, ^VIX, ^VIX3M, ^TNX, HYG, IEF) about every 30 minutes and scores them as if they were today's close. Junk bond demand uses the HYG/IEF move as a proxy for the HY spread change; financial conditions (weekly NFCI) does not update intraday. The live number is replaced by the official score after the next morning's FRED update.</li>
+        <li>Live estimate: during market hours a second job pulls delayed quotes (^GSPC, ^VIX, ^VIX3M, ^TNX, HYG, IEF) from Yahoo Finance, falling back to CBOE's delayed-quote feed, about every 30 minutes and scores them as if they were today's close. Junk bond demand uses the HYG/IEF move as a proxy for the HY spread change; financial conditions (weekly NFCI) does not update intraday. If a non-essential quote is unavailable, that component holds its last official value (marked 'held'). The live number is replaced by the official score after the next morning's FRED update.</li>
         <li>This is a sentiment gauge built in the style of CNN's index, not a copy of it, and the numbers will differ. Data updates once per US trading day via GitHub Actions. Not investment advice.</li>
       </ol>
       <div id="gen"></div>
@@ -244,7 +244,7 @@
     for (var i = 0; i < LIVE.components.length; i++) if (LIVE.components[i].key === key) c = LIVE.components[i];
     if (!c || c.score == null) return "--";
     var b = band(c.score);
-    return "<b style='color:" + b.c + "'>" + Math.round(c.score) + "</b>" + (c.live ? "" : "<div class='cdesc'>weekly</div>");
+    return "<b style='color:" + b.c + "'>" + Math.round(c.score) + "</b>" + (c.live ? "" : "<div class='cdesc'>" + (key === "fci" ? "weekly" : "held") + "</div>");
   }
 
   function renderLive() {
