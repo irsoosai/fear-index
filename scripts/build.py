@@ -250,6 +250,9 @@ def build(data):
         "score": [r(comp[i], 1) for i in idx],
         "spx": [r(px[i]) for i in idx],
         "components": {k: [r(scores[k][i], 1) for i in idx] for k, *_ in COMPONENTS},
+        # raw inputs used by the page's buy-signal confirmations
+        "raw": {"term": [r(raw["term"][i], 4) for i in idx],
+                "junk": [r(raw["junk"][i], 3) for i in idx]},
     }
 
     # Trailing inputs the intraday script (live.py) needs to score a live print
