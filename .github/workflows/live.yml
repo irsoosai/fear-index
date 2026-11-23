@@ -1,0 +1,42 @@
+name: Live intraday estimate
+
+on:
+  schedule:
+    # Every 30 min, 13:00-21:59 UTC Mon-Fri. Covers the 9:30-16:00 ET session in
+    # both daylight and standard time. The script skips runs with no new quote.
+    - cron: "*/30 13-21 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: data-commit
+  cancel-in-progress: false
+
+jobs:
+  live:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build data/live.json from intraday quotes
+        run: python scripts/live.py --fear data/fear.json --out data/live.json
+
+      - name: Commit if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898333+github-actions[bot]@users.noreply.github.com"
+          if [ ! -f data/live.json ]; then echo "No live file"; exit 0; fi
+          git add data/live.json
+          if git diff --cached --quiet; then
+            echo "No change"
+          else
+            git commit -m "data: live estimate $(date -u +%Y-%m-%dT%H:%MZ)"
+            git pull --rebase origin "${GITHUB_REF_NAME}"
+            git push
+          fi
