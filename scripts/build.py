@@ -10,6 +10,7 @@ Standard library only. Needs env var FRED_API_KEY.
 Usage: python scripts/build.py [--out data/fear.json]
 """
 import json
+import math
 import os
 import sys
 import time
@@ -256,8 +257,24 @@ def build(data):
     def tail_nonnull(x, k):
         return [r(v, 4) for v in x[:last + 1] if v is not None][-k:]
 
+    # Sensitivity of VIX3M to VIX (daily log changes, trailing window). live.py
+    # uses it to estimate VIX3M when only VIX is available intraday.
+    xs, ys = [], []
+    for i in range(max(1, last - WINDOW + 1), last + 1):
+        if vix[i] and vix[i - 1] and vxv[i] and vxv[i - 1]:
+            xs.append(math.log(vix[i] / vix[i - 1]))
+            ys.append(math.log(vxv[i] / vxv[i - 1]))
+    vxv_beta = 0.6
+    if len(xs) > 100:
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        sxx = sum((x - mx) ** 2 for x in xs)
+        if sxx > 0:
+            vxv_beta = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx
+
     state = {
         "date": dates[last],
+        "vix_last": r(vix[last], 4),
+        "vxv_beta": round(vxv_beta, 3),
         "spx_closes": [r(v, 4) for v in px[max(0, last - 259):last + 1]],
         "vix_closes": tail_nonnull(vix, 60),
         "vxv_last": r(vxv[last], 4),
