@@ -81,7 +81,8 @@
       <div class="big" id="score">--</div>
       <div class="lab" id="label">--</div>
       <div class="live" id="live">
-        <div class="row"><span class="dot"></span><b>Live estimate</b><span class="lv" id="lv">--</span><span id="lvlab"></span><span id="lvchg"></span></div>
+        <div class="row"><span class="dot"></span><b id="lvtitle">Live estimate</b><span class="lv" id="lv">--</span><span id="lvlab"></span></div>
+        <div id="lvchg" style="margin-top:2px"></div>
         <div class="meta" id="lvmeta"></div>
         <svg id="spark" viewBox="0 0 300 60" preserveAspectRatio="none"></svg>
       </div>
@@ -115,7 +116,7 @@
         <li>The composite is the equal-weight average of the available component scores (at least 5 of 7 required).</li>
         <li>Bands: 0-24 Extreme Fear, 25-44 Fear, 45-55 Neutral, 56-75 Greed, 76-100 Extreme Greed.</li>
         <li>Safe haven demand uses a 10y Treasury return proxy: -8.5 x yield change + carry. Price strength uses distance from the 52-week high in place of new highs/lows breadth, which has no free history.</li>
-        <li>Live estimate: during market hours a second job pulls delayed quotes (^GSPC, ^VIX, ^VIX3M, ^TNX, HYG, IEF) from Yahoo Finance, falling back to CBOE's delayed-quote feed, about every 30 minutes and scores them as if they were today's close. Junk bond demand uses the HYG/IEF move as a proxy for the HY spread change; financial conditions (weekly NFCI) does not update intraday. If a non-essential quote is unavailable, that component holds its last official value (marked 'held'). The live number is replaced by the official score after the next morning's FRED update.</li>
+        <li>Live estimate: during market hours a second job pulls delayed quotes (^GSPC, ^VIX, ^VIX3M, ^TNX, HYG, IEF) from CNBC, falling back to Financial Modeling Prep, Yahoo Finance and CBOE, about every 30 minutes and scores them as if they were today's close. Junk bond demand uses the HYG/IEF move as a proxy for the HY spread change; financial conditions (weekly NFCI) does not update intraday. If a non-essential quote is unavailable, that component holds its last official value (marked 'held'). If VIX3M is unavailable it is estimated from the VIX move, using VIX3M's measured sensitivity to VIX over the past 2 years (marked 'est.'). The live number is replaced by the official score after the next morning's FRED update.</li>
         <li>This is a sentiment gauge built in the style of CNN's index, not a copy of it, and the numbers will differ. Data updates once per US trading day via GitHub Actions. Not investment advice.</li>
       </ol>
       <div id="gen"></div>
@@ -141,6 +142,12 @@
   function $(id) { return document.getElementById(id); }
   function esc(s) { return String(s).replace(/[&<>"]/g, function (c) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]; }); }
   function pill(s) { var b = band(s); return b ? '<span class="pill" style="background:' + b.c + '">' + b.name + "</span>" : ""; }
+  function dayName(iso) {
+    var d = new Date(iso + "T12:00:00");
+    var wd = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][d.getDay()];
+    var mo = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"][d.getMonth()];
+    return wd + " " + mo + " " + d.getDate();
+  }
   function fmt(v, nd) { return v == null ? "--" : Number(v).toFixed(nd); }
 
   var D = null, LIVE = null, wired = false, state = { range: "1Y", series: "score", spx: true };
@@ -172,7 +179,9 @@
   function render() {
     var L = D.latest;
     $("main").style.display = "";
-    $("asof").textContent = "As of close " + L.date + "  |  S&P 500 " + fmt(L.spx, 2);
+    var hdr = "Official: " + dayName(L.date) + " close | S&P 500 " + fmt(L.spx, 2);
+    if (LIVE) hdr += "   |   Live: " + dayName(LIVE.date) + " " + LIVE.quote_time_et.split(" ")[1] + " ET | S&P 500 " + fmt(LIVE.inputs.spx, 2);
+    $("asof").textContent = hdr;
     $("gen").textContent = "Data built " + D.generated_utc + " UTC.";
     $("score").textContent = Math.round(L.score);
     var b = band(L.score);
@@ -244,7 +253,7 @@
     for (var i = 0; i < LIVE.components.length; i++) if (LIVE.components[i].key === key) c = LIVE.components[i];
     if (!c || c.score == null) return "--";
     var b = band(c.score);
-    return "<b style='color:" + b.c + "'>" + Math.round(c.score) + "</b>" + (c.live ? "" : "<div class='cdesc'>" + (key === "fci" ? "weekly" : "held") + "</div>");
+    return "<b style='color:" + b.c + "'>" + Math.round(c.score) + "</b>" + (c.est ? "<div class='cdesc'>est.</div>" : c.live ? "" : "<div class='cdesc'>" + (key === "fci" ? "weekly" : "held") + "</div>");
   }
 
   function renderLive() {
@@ -254,7 +263,11 @@
     var b = band(LIVE.score), d = LIVE.score - D.latest.score;
     $("lv").textContent = Math.round(LIVE.score); $("lv").style.color = b.c;
     $("lvlab").innerHTML = pill(LIVE.score);
-    $("lvchg").innerHTML = "<span class='" + (d >= 0 ? "up" : "dn") + "'>" + (d >= 0 ? "+" : "") + d.toFixed(0) + " vs " + D.latest.date + " close</span>";
+    $("lvtitle").textContent = "Live estimate (" + dayName(LIVE.date) + ")";
+    var dr = Math.round(LIVE.score) - Math.round(D.latest.score);
+    $("lvchg").innerHTML = "<span class='" + (dr >= 0 ? "up" : "dn") + "'>" +
+      (dr === 0 ? "Same as" : Math.abs(dr) + (dr > 0 ? " above" : " below")) +
+      " the official " + dayName(D.latest.date) + " score (" + Math.round(D.latest.score) + ")</span>";
     var t = LIVE.quote_time_et.split(" ");
     $("lvmeta").textContent = "Quotes as of " + t[1] + " ET on " + t[0] + " (delayed). S&P " + LIVE.inputs.spx + ", VIX " + LIVE.inputs.vix +
       ". Updates about every 30 min; dashed needle on the gauge.";
