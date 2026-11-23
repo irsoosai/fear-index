@@ -277,6 +277,13 @@ def run(fear_path, out_path, fetcher=None, now=None):
             q[k] = None
             print("%-6s %-7s unavailable, holding last official value (%s)" % (k, sym, e))
     qt = datetime.fromtimestamp(q["spx"]["time"], ET)
+    now_utc = now or datetime.now(timezone.utc)
+    if (qt.hour, qt.minute, qt.second) == (0, 0, 0):
+        # Source gave a date with no time of day: use the run time if it is the
+        # same session day (capped at the 16:00 close), else that day's close.
+        now_et = now_utc.astimezone(ET)
+        close = qt.replace(hour=16, minute=0)
+        qt = min(now_et, close) if now_et.date() == qt.date() else close
     qdate = qt.date().isoformat()
 
     if qdate <= fear["state"]["date"]:
@@ -291,8 +298,9 @@ def run(fear_path, out_path, fetcher=None, now=None):
                 old = json.load(f)
         except Exception:  # noqa: BLE001
             old = None
-    if old and old.get("quote_time_epoch") == q["spx"]["time"]:
-        print("No new quote since last run (%s); nothing to do" % qt.strftime("%Y-%m-%d %H:%M ET"))
+    sig = [round(q[k]["price"], 4) for k in REQUIRED]
+    if old and old.get("date") == qdate and old.get("sig") == sig:
+        print("Quotes unchanged since last run (%s); nothing to do" % old.get("quote_time_et"))
         return False
 
     score, comps, inputs = compute(fear, q)
@@ -304,14 +312,15 @@ def run(fear_path, out_path, fetcher=None, now=None):
     hhmm = qt.strftime("%H:%M")
     path = [p for p in path if p["t"] != hhmm] + [{"t": hhmm, "score": round(score, 1)}]
 
-    now = now or datetime.now(timezone.utc)
+    now = now_utc
     out = {
+        "sig": sig,
         "date": qdate,
         "official_date": fear["state"]["date"],
         "official_score": fear["latest"]["score"],
         "updated_utc": now.strftime("%Y-%m-%dT%H:%MZ"),
         "quote_time_et": qt.strftime("%Y-%m-%d %H:%M"),
-        "quote_time_epoch": q["spx"]["time"],
+        "quote_time_epoch": int(qt.timestamp()),
         "score": round(score, 1),
         "label": label(score),
         "components": comps,
