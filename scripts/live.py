@@ -12,6 +12,7 @@ Standard library only. No API key needed.
 Usage: python scripts/live.py [--fear data/fear.json] [--out data/live.json]
 Exit code 0 always when there is simply nothing new (market closed etc.).
 """
+import http.cookiejar
 import json
 import os
 import sys
@@ -31,6 +32,10 @@ SYMBOLS = {
     "spx": "^GSPC", "vix": "^VIX", "vxv": "^VIX3M", "tnx": "^TNX",
     "hyg": "HYG", "ief": "IEF",
 }
+REQUIRED = ("spx", "vix", "vxv")   # others fall back to the last official value
+PACE_SECONDS = 2.0                 # gap between symbols to stay under Yahoo's rate limit
+CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/%s.json"
+CBOE_CODE = {"^GSPC": "_SPX", "^VIX": "_VIX", "^VIX3M": "_VIX3M", "^TNX": "_TNX"}
 HYG_SPREAD_DURATION = 3.5   # converts HYG/IEF relative move to an OAS change estimate
 BOND_DURATION = 8.5
 MIN_WINDOW = 252
@@ -54,28 +59,72 @@ def label(s):
     return "Extreme Greed"
 
 
-def quote(sym, fetcher=None):
-    """Return dict(price, prev_close, time) from Yahoo chart meta."""
-    if fetcher:
-        return fetcher(sym)
+_OPENER = None
+
+
+def _opener():
+    """URL opener with a cookie jar, primed with Yahoo's consent cookie (reduces 429s)."""
+    global _OPENER
+    if _OPENER is None:
+        jar = http.cookiejar.CookieJar()
+        _OPENER = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        try:
+            _OPENER.open(urllib.request.Request("https://fc.yahoo.com", headers={"User-Agent": UA}), timeout=15)
+        except Exception:  # noqa: BLE001  (fc.yahoo.com answers 404 but still sets the cookie)
+            pass
+    return _OPENER
+
+
+def _get_json(url):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+    with _opener().open(req, timeout=30) as r:
+        return json.load(r)
+
+
+def quote_yahoo(sym):
     path = "/v8/finance/chart/%s?%s" % (
         urllib.parse.quote(sym), urllib.parse.urlencode({"interval": "5m", "range": "1d"}))
     last_err = None
-    for attempt in range(3):
-        for host in HOSTS:
+    for host in HOSTS:
+        try:
+            meta = _get_json(host + path)["chart"]["result"][0]["meta"]
+            return {
+                "price": float(meta["regularMarketPrice"]),
+                "prev_close": float(meta.get("chartPreviousClose") or meta.get("previousClose")),
+                "time": int(meta["regularMarketTime"]),
+                "src": "yahoo",
+            }
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    raise RuntimeError("yahoo: %s" % last_err)
+
+
+def quote_cboe(sym):
+    """CBOE delayed-quote feed (about 15 min delay). Indices use a leading underscore."""
+    code = CBOE_CODE.get(sym, sym)
+    d = _get_json(CBOE_URL % code)["data"]
+    t = datetime.fromisoformat(str(d["last_trade_time"])[:19]).replace(tzinfo=ET)
+    return {
+        "price": float(d["current_price"]),
+        "prev_close": float(d["prev_day_close"]),
+        "time": int(t.timestamp()),
+        "src": "cboe",
+    }
+
+
+def quote(sym, fetcher=None):
+    """Yahoo first, CBOE fallback, then one slower retry of both."""
+    if fetcher:
+        return fetcher(sym)
+    errs = []
+    for attempt in range(2):
+        for fn in (quote_yahoo, quote_cboe):
             try:
-                req = urllib.request.Request(host + path, headers={"User-Agent": UA, "Accept": "application/json"})
-                with urllib.request.urlopen(req, timeout=30) as r:
-                    meta = json.load(r)["chart"]["result"][0]["meta"]
-                return {
-                    "price": float(meta["regularMarketPrice"]),
-                    "prev_close": float(meta.get("chartPreviousClose") or meta.get("previousClose")),
-                    "time": int(meta["regularMarketTime"]),
-                }
+                return fn(sym)
             except Exception as e:  # noqa: BLE001
-                last_err = e
-        time.sleep(3 * (attempt + 1))
-    raise RuntimeError("Yahoo quote failed for %s: %s" % (sym, last_err))
+                errs.append("%s" % e if fn is quote_yahoo else "cboe: %s" % e)
+        time.sleep(10)
+    raise RuntimeError("quote failed for %s (%s)" % (sym, "; ".join(errs[-2:])))
 
 
 def pct_score(window, v, direction):
@@ -91,18 +140,24 @@ def pct_score(window, v, direction):
 def compute(fear, q):
     S = fear["state"]
     spx, vix, vxv = q["spx"]["price"], q["vix"]["price"], q["vxv"]["price"]
-    tnx = q["tnx"]["price"]
-    if tnx > 20:          # older Yahoo convention quoted ^TNX as yield x 10
-        tnx /= 10.0
+    if q.get("tnx"):
+        tnx = q["tnx"]["price"]
+        if tnx > 20:      # ^TNX / _TNX are sometimes quoted as yield x 10
+            tnx /= 10.0
+    else:
+        tnx = S["y10_tail"][-1]     # no live yield: hold last official close
 
     closes = S["spx_closes"]
     ma125 = (sum(closes[-124:]) + spx) / 125.0
     hi252 = max(closes[-251:] + [spx])
     vma50 = (sum(S["vix_closes"][-49:]) + vix) / 50.0
 
-    ratio_now = q["hyg"]["price"] / q["ief"]["price"]
-    ratio_prev = q["hyg"]["prev_close"] / q["ief"]["prev_close"]
-    hy_est = S["hy_last"] - (ratio_now / ratio_prev - 1) * 100.0 / HYG_SPREAD_DURATION
+    if q.get("hyg") and q.get("ief"):
+        ratio_now = q["hyg"]["price"] / q["ief"]["price"]
+        ratio_prev = q["hyg"]["prev_close"] / q["ief"]["prev_close"]
+        hy_est = S["hy_last"] - (ratio_now / ratio_prev - 1) * 100.0 / HYG_SPREAD_DURATION
+    else:
+        hy_est = S["hy_last"]       # no live credit quote: hold last official OAS
 
     y_then = S["y10_tail"][0]
     stock20 = (spx / closes[-20] - 1) * 100.0
@@ -121,16 +176,21 @@ def compute(fear, q):
     for c in fear["latest"]["components"]:
         k = c["key"]
         s = pct_score(S["raw_windows"][k], raw[k], DIRECTION[k])
+        is_live = {"fci": False, "junk": bool(q.get("hyg") and q.get("ief"))}.get(k, True)
         comps.append({"key": k, "raw": round(raw[k], 3),
                       "score": None if s is None else round(s, 1),
-                      "live": k != "fci"})
+                      "live": is_live})
         if s is not None:
             vals.append(s)
     score = sum(vals) / len(vals) if len(vals) >= 5 else None
     return score, comps, {
         "spx": round(spx, 2), "vix": round(vix, 2), "vix3m": round(vxv, 2),
-        "tnx": round(tnx, 3), "hyg": round(q["hyg"]["price"], 2),
-        "ief": round(q["ief"]["price"], 2), "hy_oas_est": round(hy_est, 3),
+        "tnx": round(tnx, 3),
+        "hyg": round(q["hyg"]["price"], 2) if q.get("hyg") else None,
+        "ief": round(q["ief"]["price"], 2) if q.get("ief") else None,
+        "hy_oas_est": round(hy_est, 3),
+        "sources": {k: v["src"] for k, v in q.items() if v and "src" in v},
+        "missing": [k for k in SYMBOLS if not q.get(k)],
     }
 
 
@@ -141,7 +201,18 @@ def run(fear_path, out_path, fetcher=None, now=None):
         print("fear.json has no state block yet; run build.py first")
         return False
 
-    q = {k: quote(s, fetcher) for k, s in SYMBOLS.items()}
+    q = {}
+    for i, (k, sym) in enumerate(SYMBOLS.items()):
+        if i and not fetcher:
+            time.sleep(PACE_SECONDS)
+        try:
+            q[k] = quote(sym, fetcher)
+            print("%-6s %-7s %10.3f  via %s" % (k, sym, q[k]["price"], q[k].get("src", "test")))
+        except Exception as e:  # noqa: BLE001
+            if k in REQUIRED:
+                raise
+            q[k] = None
+            print("%-6s %-7s unavailable, holding last official value (%s)" % (k, sym, e))
     qt = datetime.fromtimestamp(q["spx"]["time"], ET)
     qdate = qt.date().isoformat()
 
