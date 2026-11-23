@@ -15,6 +15,7 @@ Exit code 0 always when there is simply nothing new (market closed etc.).
 import http.cookiejar
 import json
 import os
+import re
 import sys
 import time
 import urllib.parse
@@ -33,8 +34,11 @@ SYMBOLS = {
     "hyg": "HYG", "ief": "IEF",
 }
 REQUIRED = ("spx", "vix", "vxv")   # others fall back to the last official value
-PACE_SECONDS = 2.0                 # gap between symbols to stay under Yahoo's rate limit
+PACE_SECONDS = 1.0                 # gap between symbols (only matters when Yahoo is used)
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/%s.json"
+CNBC_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
+CNBC_CODE = {"^GSPC": ".SPX", "^VIX": ".VIX", "^VIX3M": ".VIX3M", "^TNX": "US10Y",
+             "HYG": "HYG", "IEF": "IEF"}
 CBOE_CODE = {"^GSPC": "_SPX", "^VIX": "_VIX", "^VIX3M": "_VIX3M", "^TNX": "_TNX"}
 HYG_SPREAD_DURATION = 3.5   # converts HYG/IEF relative move to an OAS change estimate
 BOND_DURATION = 8.5
@@ -75,8 +79,11 @@ def _opener():
     return _OPENER
 
 
-def _get_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Accept": "application/json"})
+def _get_json(url, extra=None):
+    h = {"User-Agent": UA, "Accept": "application/json, text/plain, */*",
+         "Accept-Language": "en-US,en;q=0.9"}
+    h.update(extra or {})
+    req = urllib.request.Request(url, headers=h)
     with _opener().open(req, timeout=30) as r:
         return json.load(r)
 
@@ -102,7 +109,7 @@ def quote_yahoo(sym):
 def quote_cboe(sym):
     """CBOE delayed-quote feed (about 15 min delay). Indices use a leading underscore."""
     code = CBOE_CODE.get(sym, sym)
-    d = _get_json(CBOE_URL % code)["data"]
+    d = _get_json(CBOE_URL % code, {"Referer": "https://www.cboe.com/", "Origin": "https://www.cboe.com"})["data"]
     t = datetime.fromisoformat(str(d["last_trade_time"])[:19]).replace(tzinfo=ET)
     return {
         "price": float(d["current_price"]),
@@ -112,19 +119,75 @@ def quote_cboe(sym):
     }
 
 
+_CNBC_CACHE = None
+
+
+def _num(x):
+    if x is None:
+        return None
+    t = str(x).replace(",", "").replace("%", "").strip()
+    return float(t) if t not in ("", "UNCH", "--") else None
+
+
+def _iso_time(t):
+    t = str(t).strip()
+    m = re.match(r"^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.\d+)?([+-]\d{2}):?(\d{2})$", t)
+    if m:
+        return datetime.fromisoformat("%s%s:%s" % m.groups())
+    return datetime.fromisoformat(t[:19]).replace(tzinfo=ET)
+
+
+def _cnbc_batch():
+    """One request for all symbols via CNBC's public quote service."""
+    global _CNBC_CACHE
+    if isinstance(_CNBC_CACHE, Exception):
+        raise _CNBC_CACHE          # don't re-hit a source that already refused this run
+    if _CNBC_CACHE is None:
+        syms = "|".join(CNBC_CODE[s] for s in SYMBOLS.values())
+        url = CNBC_URL + "?" + urllib.parse.urlencode({
+            "symbols": syms, "requestMethod": "itv", "noform": "1", "partnerId": "2",
+            "fund": "1", "exthrs": "1", "output": "json", "events": "1"})
+        try:
+            j = _get_json(url, {"Referer": "https://www.cnbc.com/"})
+            rows = j["FormattedQuoteResult"]["FormattedQuote"]
+        except Exception as e:  # noqa: BLE001
+            _CNBC_CACHE = RuntimeError("cnbc: %s" % e)
+            raise _CNBC_CACHE
+        if isinstance(rows, dict):
+            rows = [rows]
+        _CNBC_CACHE = {r.get("symbol"): r for r in rows}
+    return _CNBC_CACHE
+
+
+def quote_cnbc(sym):
+    r = _cnbc_batch().get(CNBC_CODE[sym])
+    if not r:
+        raise RuntimeError("cnbc: symbol %s not in response" % CNBC_CODE[sym])
+    last = _num(r.get("last"))
+    prev = _num(r.get("previous_day_closing"))
+    if prev is None and last is not None and _num(r.get("change")) is not None:
+        prev = last - _num(r.get("change"))
+    if last is None or prev is None or not r.get("last_time"):
+        raise RuntimeError("cnbc: incomplete quote for %s" % CNBC_CODE[sym])
+    return {"price": last, "prev_close": prev,
+            "time": int(_iso_time(r["last_time"]).timestamp()), "src": "cnbc"}
+
+
+SOURCES = (("cnbc", quote_cnbc), ("yahoo", quote_yahoo), ("cboe", quote_cboe))
+
+
 def quote(sym, fetcher=None):
-    """Yahoo first, CBOE fallback, then one slower retry of both."""
+    """Try each free source in turn; first success wins."""
     if fetcher:
         return fetcher(sym)
     errs = []
-    for attempt in range(2):
-        for fn in (quote_yahoo, quote_cboe):
-            try:
-                return fn(sym)
-            except Exception as e:  # noqa: BLE001
-                errs.append("%s" % e if fn is quote_yahoo else "cboe: %s" % e)
-        time.sleep(10)
-    raise RuntimeError("quote failed for %s (%s)" % (sym, "; ".join(errs[-2:])))
+    for name, fn in SOURCES:
+        try:
+            return fn(sym)
+        except Exception as e:  # noqa: BLE001
+            msg = str(e)
+            errs.append(msg if msg.startswith(name) else "%s: %s" % (name, msg))
+    raise RuntimeError("quote failed for %s (%s)" % (sym, "; ".join(errs)))
 
 
 def pct_score(window, v, direction):
