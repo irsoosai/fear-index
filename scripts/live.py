@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from bisect import bisect_left, bisect_right
@@ -33,7 +34,9 @@ SYMBOLS = {
     "spx": "^GSPC", "vix": "^VIX", "vxv": "^VIX3M", "tnx": "^TNX",
     "hyg": "HYG", "ief": "IEF",
 }
-REQUIRED = ("spx", "vix", "vxv")   # others fall back to the last official value
+REQUIRED = ("spx", "vix")          # VIX3M is estimated from VIX if missing; others hold last official
+FMP_URL = "https://financialmodelingprep.com/stable/quote"
+FMP_KEY = os.environ.get("FMP_API_KEY", "").strip()
 PACE_SECONDS = 1.0                 # gap between symbols (only matters when Yahoo is used)
 CBOE_URL = "https://cdn.cboe.com/api/global/delayed_quotes/quotes/%s.json"
 CNBC_URL = "https://quote.cnbc.com/quote-html-webservice/restQuote/symbolType/symbol"
@@ -173,7 +176,30 @@ def quote_cnbc(sym):
             "time": int(_iso_time(r["last_time"]).timestamp()), "src": "cnbc"}
 
 
-SOURCES = (("cnbc", quote_cnbc), ("yahoo", quote_yahoo), ("cboe", quote_cboe))
+def quote_fmp(sym):
+    """Financial Modeling Prep (free key). Free plan covers ^GSPC and ^VIX, not ^VIX3M."""
+    if not FMP_KEY:
+        raise RuntimeError("fmp: no FMP_API_KEY set")
+    url = FMP_URL + "?" + urllib.parse.urlencode({"symbol": sym, "apikey": FMP_KEY})
+    try:
+        j = _get_json(url)
+    except urllib.error.HTTPError as e:
+        raise RuntimeError("fmp: HTTP %s" % e.code)  # don't echo the URL (contains the key)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError("fmp: %s" % str(e).replace(FMP_KEY, "***"))
+    if isinstance(j, dict):
+        raise RuntimeError("fmp: %s" % (j.get("Error Message") or j.get("message") or "error")[:120])
+    if not j:
+        raise RuntimeError("fmp: no data for %s (likely not on free plan)" % sym)
+    d = j[0]
+    ts = int(d.get("timestamp") or 0)
+    if ts > 10 ** 11:          # milliseconds
+        ts //= 1000
+    return {"price": float(d["price"]), "prev_close": float(d["previousClose"]),
+            "time": ts or int(time.time()), "src": "fmp"}
+
+
+SOURCES = (("cnbc", quote_cnbc), ("fmp", quote_fmp), ("yahoo", quote_yahoo), ("cboe", quote_cboe))
 
 
 def quote(sym, fetcher=None):
@@ -202,7 +228,14 @@ def pct_score(window, v, direction):
 
 def compute(fear, q):
     S = fear["state"]
-    spx, vix, vxv = q["spx"]["price"], q["vix"]["price"], q["vxv"]["price"]
+    spx, vix = q["spx"]["price"], q["vix"]["price"]
+    vxv_est = not q.get("vxv")
+    if vxv_est:
+        # VIX3M ~ last VIX3M close x (VIX / VIX prev close) ^ beta
+        vix_prev = q["vix"]["prev_close"] or S.get("vix_last") or S["vix_closes"][-1]
+        vxv = S["vxv_last"] * (vix / vix_prev) ** S.get("vxv_beta", 0.6)
+    else:
+        vxv = q["vxv"]["price"]
     if q.get("tnx"):
         tnx = q["tnx"]["price"]
         if tnx > 20:      # ^TNX / _TNX are sometimes quoted as yield x 10
@@ -242,12 +275,12 @@ def compute(fear, q):
         is_live = {"fci": False, "junk": bool(q.get("hyg") and q.get("ief"))}.get(k, True)
         comps.append({"key": k, "raw": round(raw[k], 3),
                       "score": None if s is None else round(s, 1),
-                      "live": is_live})
+                      "live": is_live, "est": k == "term" and vxv_est})
         if s is not None:
             vals.append(s)
     score = sum(vals) / len(vals) if len(vals) >= 5 else None
     return score, comps, {
-        "spx": round(spx, 2), "vix": round(vix, 2), "vix3m": round(vxv, 2),
+        "spx": round(spx, 2), "vix": round(vix, 2), "vix3m": round(vxv, 2), "vix3m_estimated": vxv_est,
         "tnx": round(tnx, 3),
         "hyg": round(q["hyg"]["price"], 2) if q.get("hyg") else None,
         "ief": round(q["ief"]["price"], 2) if q.get("ief") else None,
@@ -275,7 +308,8 @@ def run(fear_path, out_path, fetcher=None, now=None):
             if k in REQUIRED:
                 raise
             q[k] = None
-            print("%-6s %-7s unavailable, holding last official value (%s)" % (k, sym, e))
+            how = "estimating from VIX" if k == "vxv" else "holding last official value"
+            print("%-6s %-7s unavailable, %s (%s)" % (k, sym, how, e))
     qt = datetime.fromtimestamp(q["spx"]["time"], ET)
     now_utc = now or datetime.now(timezone.utc)
     if (qt.hour, qt.minute, qt.second) == (0, 0, 0):
