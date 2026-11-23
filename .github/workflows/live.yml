@@ -2,9 +2,9 @@ name: Live intraday estimate
 
 on:
   schedule:
-    # Every 30 min, 13:00-21:59 UTC Mon-Fri. Covers the 9:30-16:00 ET session in
+    # Every 30 min at :07/:37 (off the busy :00/:30), 13:00-21:59 UTC Mon-Fri. Covers the 9:30-16:00 ET session in
     # both daylight and standard time. The script skips runs with no new quote.
-    - cron: "*/30 13-21 * * 1-5"
+    - cron: "7,37 13-21 * * 1-5"
   workflow_dispatch: {}
 
 permissions:
