@@ -2,7 +2,8 @@ name: Update fear index
 
 on:
   schedule:
-    # Tue-Sat 12:17 UTC (about 6:17 AM Central): FRED posts prior-day VIX/SPX/OAS overnight
+    # Mon-Sat 12:17 UTC (about 6:17 AM Central): FRED posts prior-day data overnight;
+    # the Monday run catches Friday closes that FRED posts late.
     - cron: "17 12 * * 1-6"
   workflow_dispatch: {}
 
@@ -17,9 +18,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
