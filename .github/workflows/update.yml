@@ -3,7 +3,7 @@ name: Update fear index
 on:
   schedule:
     # Tue-Sat 12:17 UTC (about 6:17 AM Central): FRED posts prior-day VIX/SPX/OAS overnight
-    - cron: "17 12 * * 2-6"
+    - cron: "17 12 * * 1-6"
   workflow_dispatch: {}
 
 permissions:
